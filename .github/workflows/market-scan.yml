@@ -1,0 +1,21 @@
+name: Auto Market Scan
+
+on:
+  schedule:
+    # 9:00 AM Toronto (pre-open scan). Toronto = UTC-4 right now.
+    - cron: "0 13 * * 1-5"
+    # Every 15 min during market hours 9:30–4:00 Toronto (13:30–20:00 UTC)
+    - cron: "*/15 13-20 * * 1-5"
+  workflow_dispatch: {}   # lets you press "Run workflow" to test
+
+jobs:
+  ping-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pre-open scan
+        if: ${{ startsWith(github.event.schedule, '0 13') || github.event_name == 'workflow_dispatch' }}
+        run: curl -fsSL https://stock-watch-uqc1.onrender.com/scan/preopen || exit 0
+
+      - name: Live scan
+        if: ${{ startsWith(github.event.schedule, '*/15') || github.event_name == 'workflow_dispatch' }}
+        run: curl -fsSL https://stock-watch-uqc1.onrender.com/scan || exit 0
