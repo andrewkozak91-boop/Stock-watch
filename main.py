@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 import os, time, threading, requests
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo  # stdlib, no extra dependency
+from zoneinfo import ZoneInfo  # stdlib
 
 app = Flask(__name__)
 
@@ -10,6 +10,7 @@ API_KEY = os.getenv("FINNHUB_API_KEY")
 BASE = "https://finnhub.io/api/v1"
 TZ = ZoneInfo("America/Toronto")
 
+# Default universe (sub-$30, liquid themes; tweak anytime)
 UNIVERSE_DEFAULT = [
     "T","PFE","F","AAL","CCL","NCLH","RIVN","HOOD","SOFI","DNA",
     "RIOT","MARA","CHPT","BLNK","RUN","PLUG","NKLA","QS","OPEN","ENVX",
@@ -19,8 +20,18 @@ UNIVERSE_DEFAULT = [
 
 PRICE_MAX_DEFAULT = 30.0
 FLOAT_MAX = 150_000_000
-VOLUME_SHARES_GATE = 2_000_000
-VOLUME_FLOAT_PCT_GATE = 0.0075
+
+# Original 7.5 hard gates
+VOLUME_SHARES_GATE_HARD = 2_000_000
+VOLUME_FLOAT_PCT_GATE_HARD = 0.0075  # 0.75%
+
+# Balanced (early-session relaxed) gates
+VOLUME_SHARES_GATE_EARLY = 1_200_000
+VOLUME_FLOAT_PCT_GATE_EARLY = 0.0050  # 0.50%
+
+# Aggressive (optional mode, early session only)
+VOLUME_SHARES_GATE_AGGR = 1_000_000
+VOLUME_FLOAT_PCT_GATE_AGGR = 0.0040  # 0.40%
 
 REAL_CATALYST_KEYWORDS = [
     "earnings","guidance","m&a","acquisition","merger","takeover",
@@ -33,12 +44,11 @@ near_trigger_board = []
 last_scan_meta = {"when": 0, "count": 0, "mode": "init"}
 last_error = None
 
-# Autoscan (in-process, no cron)
+# Autoscan toggle + meta
 AUTOSCAN_ENABLED = True if os.getenv("AUTOSCAN", "1") == "1" else False
 last_autoscan_meta = {"when": 0, "count": 0, "mode": None, "ran": False}
 
-
-# ====== FINNHUB HELPERS ======
+# ====== HELPERS ======
 def _fh(url, params=None):
     global last_error
     params = params or {}
@@ -70,17 +80,18 @@ def get_15m_volume(symbol):
         return 0
     return int(data["v"][-1])
 
-def volume_gate_ok(vol15, free_float):
-    gate1 = vol15 >= VOLUME_SHARES_GATE
-    gate2 = free_float and vol15 >= free_float * VOLUME_FLOAT_PCT_GATE
-    return gate1 or gate2
+def looks_like_adr(profile):
+    name = (profile.get("name") or "").upper()
+    ticker = (profile.get("ticker") or "").upper()
+    country = (profile.get("country") or "").upper()
+    return ("ADR" in name) or (ticker.endswith("Y") and country not in ("USA","US","UNITED STATES"))
 
 def has_real_catalyst(symbol):
     try:
         to = datetime.utcnow().strftime("%Y-%m-%d")
         frm = (datetime.utcnow()-timedelta(days=7)).strftime("%Y-%m-%d")
         news = _fh(f"{BASE}/company-news", {"symbol": symbol, "from": frm, "to": to}) or []
-        titles = " ".join(n.get("headline","").lower() for n in news[:25])
+        titles = " ".join(n.get("headline","").lower() for n in news[:30])
         if any(k in titles for k in REAL_CATALYST_KEYWORDS):
             return ("Real", "Tier-1/2 catalyst")
         if any(k in titles for k in SPECULATIVE_KEYWORDS):
@@ -96,14 +107,8 @@ def classify_tier(is_adr, catalyst_kind):
         return ("Tier-2","B")
     return ("Tier-1","A")
 
-def looks_like_adr(profile):
-    name = (profile.get("name") or "").upper()
-    ticker = (profile.get("ticker") or "").upper()
-    country = (profile.get("country") or "").upper()
-    return ("ADR" in name) or (ticker.endswith("Y") and country not in ("USA","US","UNITED STATES"))
-
 def derive_trigger(price):
-    trig = round(price * 1.02, 2)
+    trig = round(price * 1.02, 2)  # simple 2% over price as placeholder
     pct = f"+{round((trig/price - 1)*100, 2)}%"
     return trig, pct
 
@@ -111,48 +116,103 @@ def to_bool(x, default=False):
     if x is None: return default
     return str(x).lower() in ("1","true","yes","on","y")
 
+def in_market_hours(now_tz):
+    # 9:30–16:00 ET
+    if now_tz.weekday() >= 5:  # weekend
+        return False
+    if (now_tz.hour, now_tz.minute) < (9,30):
+        return False
+    if (now_tz.hour, now_tz.minute) > (16,0):
+        return False
+    return True
+
+def get_dynamic_gates(mode, now_tz):
+    """Return (shares_gate, float_pct_gate, prox_real, prox_other)."""
+    # Defaults (strict)
+    shares_gate = VOLUME_SHARES_GATE_HARD
+    float_gate = VOLUME_FLOAT_PCT_GATE_HARD
+    prox_real = 3.0  # % to trigger allowed for real catalysts (balanced/strict)
+    prox_other = 2.0 # tighter for none/spec
+
+    if mode == "strict":
+        return shares_gate, float_gate, prox_real, prox_other
+
+    # Balanced (default)
+    if (now_tz.hour, now_tz.minute) < (10,30) and in_market_hours(now_tz):
+        shares_gate = VOLUME_SHARES_GATE_EARLY
+        float_gate = VOLUME_FLOAT_PCT_GATE_EARLY
+
+    if mode == "aggressive":
+        # Early-session only—we still cap looseness to first 60 minutes
+        if (now_tz.hour, now_tz.minute) < (10,30) and in_market_hours(now_tz):
+            shares_gate = VOLUME_SHARES_GATE_AGGR
+            float_gate = VOLUME_FLOAT_PCT_GATE_AGGR
+            prox_real = 3.5
+
+    return shares_gate, float_gate, prox_real, prox_other
 
 # ====== SCAN CORE ======
-def scan_one(symbol, price_max, strict_volume=True, fast=False):
-    profile = {} if fast else get_profile(symbol)
+def scan_one(symbol, price_max, mode="balanced"):
+    now_tz = datetime.now(TZ)
+    shares_gate, float_gate, prox_real, prox_other = get_dynamic_gates(mode, now_tz)
+
+    profile = get_profile(symbol)
     quote = get_quote(symbol)
     price = float(quote.get("c") or 0)
     prev_close = float(quote.get("pc") or price)
     if price <= 0 or price > price_max:
         return None
 
+    # float proxy from shareOutstanding (Finnhub returns in shares or millions; normalize)
     free_float = None
-    if not fast:
-        so = profile.get("shareOutstanding")
-        if so:
-            try:
-                free_float = float(so) if so > 1_000_000 else float(so)*1_000_000
-            except:
-                free_float = None
+    so = profile.get("shareOutstanding")
+    if so:
+        try:
+            free_float = float(so) if so > 1_000_000 else float(so)*1_000_000
+        except:
+            free_float = None
 
-    is_adr = looks_like_adr(profile) if not fast else False
+    is_adr = looks_like_adr(profile)
     vol15 = get_15m_volume(symbol)
-    vol_ok = volume_gate_ok(vol15, free_float or 0)
-    catalyst_kind, catalyst_note = ("None","") if fast else has_real_catalyst(symbol)
+    vol_ok = (vol15 >= shares_gate) or (free_float and vol15 >= free_float * float_gate)
+    catalyst_kind, catalyst_note = has_real_catalyst(symbol)
 
-    if not fast and free_float and free_float > FLOAT_MAX and catalyst_kind != "Real":
-        return None
-    if strict_volume and not vol_ok:
+    # Override: float rule can be exceeded only if Real catalyst present
+    if free_float and free_float > FLOAT_MAX and catalyst_kind != "Real":
         return None
 
+    # ADRs allowed but auto-class as Tier-2+
     vwap_status = "Above" if price >= prev_close else "Below"
-    tier, grade = classify_tier(is_adr, catalyst_kind)
+
+    # derive a simple technical trigger 2% above
     trigger, pct_to_trigger = derive_trigger(price)
+    try:
+        gap = float(pct_to_trigger.replace("%","").replace("+",""))
+    except:
+        gap = 2.0
+
+    # Proximity rule based on catalyst strength
+    max_gap = prox_real if catalyst_kind == "Real" else prox_other
+    if gap > max_gap:
+        return None
+
+    # Catalyst NONE is allowed ONLY if strict volume passes and VWAP Above
+    if catalyst_kind == "None":
+        if not vol_ok or vwap_status != "Above":
+            return None
+
+    # Spec PR allowed (Tier-3 tiny size only)
+    tier, grade = classify_tier(is_adr, catalyst_kind)
 
     note = []
     if catalyst_kind == "Spec": note.append("Spec PR — tiny size only")
     if is_adr: note.append("ADR (Tier-2+)")
 
-    try:
-        gap = float(pct_to_trigger.replace("%","").replace("+",""))
-    except:
-        gap = 2.0
-    score = (5 if catalyst_kind=="Real" else 2) + (3 if vol_ok else 0) + (3 if vwap_status=="Above" else 0) - gap
+    # rank score
+    score = (5 if catalyst_kind=="Real" else (1 if catalyst_kind=="None" else 0))
+    score += 3 if vol_ok else 0
+    score += 3 if vwap_status=="Above" else 0
+    score -= gap
 
     return {
         "symbol": symbol,
@@ -167,11 +227,11 @@ def scan_one(symbol, price_max, strict_volume=True, fast=False):
         "_score": score
     }
 
-def run_scan(universe, price_max, strict_volume=True, fast=False):
+def run_scan(universe, price_max, mode="balanced"):
     rows = []
     for sym in universe:
         try:
-            r = scan_one(sym, price_max, strict_volume, fast)
+            r = scan_one(sym, price_max, mode=mode)
             if r: rows.append(r)
         except Exception as e:
             global last_error
@@ -182,7 +242,6 @@ def run_scan(universe, price_max, strict_volume=True, fast=False):
         r.pop("_score", None)
     return rows
 
-
 # ====== HTTP ROUTES ======
 @app.route("/")
 def root():
@@ -190,15 +249,15 @@ def root():
 
 @app.route("/scan")
 def http_scan():
-    """ /scan?fast=1&force=1&price_max=30&symbols=AAPL,AMD """
+    """ /scan?mode=balanced|strict|aggressive&price_max=30&symbols=AAPL,AMD """
     global near_trigger_board, last_scan_meta
-    fast = to_bool(request.args.get("fast"), False)
-    force = to_bool(request.args.get("force"), False)
+    mode = (request.args.get("mode") or "balanced").lower().strip()
+    if mode not in ("balanced","strict","aggressive"):
+        mode = "balanced"
     price_max = float(request.args.get("price_max") or PRICE_MAX_DEFAULT)
     syms_arg = (request.args.get("symbols") or "").strip()
     universe = [s.strip().upper() for s in syms_arg.split(",") if s.strip()] if syms_arg else UNIVERSE_DEFAULT[:]
-    mode = ("fast-" if fast else "") + ("lenient" if force else "strict")
-    near_trigger_board = run_scan(universe, price_max, strict_volume=not force, fast=fast)
+    near_trigger_board = run_scan(universe, price_max, mode=mode)
     last_scan_meta = {"when": int(time.time()), "count": len(near_trigger_board), "mode": mode, "price_max": price_max, "universe": len(universe)}
     return jsonify({"message":"scan complete", **last_scan_meta})
 
@@ -237,53 +296,45 @@ def autoscan_toggle():
         AUTOSCAN_ENABLED = to_bool(val, AUTOSCAN_ENABLED)
     return jsonify({"autoscan_enabled": AUTOSCAN_ENABLED})
 
-
-# ====== AUTOSCAN LOOP (runs in background) ======
+# ====== AUTOSCAN LOOP ======
 def should_run_now(now_tz: datetime):
-    """Return (run, fast, force, mode_string) for current time in Toronto."""
-    # Pre-bell micro-refresh at 09:25 (fast lenient)
-    if now_tz.hour == 9 and now_tz.minute == 25:
-        return True, True, True, "fast-lenient (09:25 micro-refresh)"
-    # Market hours strict every 20 minutes (e.g., :10, :30, :50)
-    if 9 <= now_tz.hour <= 15 or (now_tz.hour == 16 and now_tz.minute == 0):
-        if now_tz.hour < 9 or (now_tz.hour == 9 and now_tz.minute < 30):
-            return False, False, False, None  # before 9:30
-        if now_tz.minute in (10, 30, 50):
-            return True, False, False, "strict (20-min cadence)"
-    return False, False, False, None
+    # 09:25 pre-bell micro-refresh (balanced)
+    if now_tz.hour == 9 and now_tz.minute == 25 and now_tz.weekday() < 5:
+        return True, "balanced", "09:25 micro-refresh"
+    # Market hours every 15 minutes
+    if now_tz.weekday() < 5 and in_market_hours(now_tz):
+        if now_tz.minute in (0, 15, 30, 45):
+            return True, "balanced", "market 15-min cadence"
+    return False, None, None
 
 def autoscan_loop():
     global near_trigger_board, last_autoscan_meta
-    # To avoid duplicate runs within the same minute
-    last_run_stamp = None
+    last_stamp = None
     while True:
         try:
             if AUTOSCAN_ENABLED:
                 now_tz = datetime.now(TZ).replace(second=0, microsecond=0)
+                run, mode, mode_desc = should_run_now(now_tz)
                 stamp = now_tz.strftime("%Y-%m-%d %H:%M")
-                run, fast, force, mode = should_run_now(now_tz)
-                if run and stamp != last_run_stamp:
-                    # run scan
-                    board = run_scan(UNIVERSE_DEFAULT, PRICE_MAX_DEFAULT, strict_volume=not force, fast=fast)
+                if run and stamp != last_stamp:
+                    board = run_scan(UNIVERSE_DEFAULT, PRICE_MAX_DEFAULT, mode=mode)
                     near_trigger_board[:] = board
                     last_autoscan_meta = {
                         "when": int(time.time()),
                         "count": len(board),
-                        "mode": mode,
+                        "mode": mode_desc,
                         "ran": True
                     }
-                    last_run_stamp = stamp
-        except Exception as e:
-            # swallow and keep loop alive
+                    last_stamp = stamp
+        except Exception:
             pass
-        time.sleep(5)  # check every 5s
+        time.sleep(5)
 
-# Start background thread (daemon)
 def start_autoscan_thread():
     t = threading.Thread(target=autoscan_loop, daemon=True)
     t.start()
 
-# ====== RUN LOCAL ======
+# ====== RUN ======
 if __name__ == "__main__":
     start_autoscan_thread()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
