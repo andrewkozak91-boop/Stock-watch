@@ -135,4 +135,56 @@ def scan_symbol(symbol):
         "trigger": trigger,
         "%_to_trigger": pct_to_trigger,
         "VWAP_Status": vwap_status,
-        "15m_Vol_vs_Req": f"{'Meets' if vol_ok else 'Below'} ({vol
+        "15m_Vol_vs_Req": f"{'Meets' if vol_ok else 'Below'} ({vol15:,})",
+        "price": round(price, 3),
+        "Catalyst": f"{catalyst_kind}: {catalyst_note}",
+        "Note": "; ".join(note) if note else "",
+        "_score": score
+    }
+
+def run_scan():
+    results = []
+    for sym in UNIVERSE:
+        try:
+            row = scan_symbol(sym)
+            if row:
+                results.append(row)
+        except Exception as e:
+            print(f"Scan error {sym}: {e}")
+            continue
+    results.sort(key=lambda r: r["_score"], reverse=True)
+    for r in results:
+        r.pop("_score", None)
+    return results
+
+# ----------- ROUTES -----------
+
+@app.route("/")
+def root():
+    return "OK", 200
+
+@app.route("/ping")
+def ping():
+    return jsonify(ok=True, ts=int(time.time())), 200
+
+@app.route("/scan")
+def scan():
+    global near_trigger_board
+    near_trigger_board = run_scan()
+    return jsonify({"message": "scan complete", "count": len(near_trigger_board)})
+
+@app.route("/board")
+def board():
+    return jsonify({
+        "age_min": round((time.time() % 900)/60, 2),
+        "count": len(near_trigger_board),
+        "near_trigger_board": near_trigger_board,
+        "stale": False,
+        "ts": int(time.time())
+    })
+
+# --------------------------------
+
+if __name__ == "__main__":
+    near_trigger_board = []
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
