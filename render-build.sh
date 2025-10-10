@@ -5,4 +5,4 @@ export PIP_NO_BUILD_ISOLATION=1
 python -V
 pip install --upgrade pip setuptools wheel
 pip install --no-cache-dir -r requirements.txt
-echo "✅ Render build complete."
+echo "Render build complete."
