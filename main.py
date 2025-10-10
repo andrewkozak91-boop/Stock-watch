@@ -1,289 +1,350 @@
-# main.py
-# Dynamic Universe + 7.5-lite scan (free data only)
+from __future__ import annotations
+from flask import Flask, jsonify, request
+import os, time, math, textwrap, pathlib
+from datetime import datetime, timedelta
 
-from flask import Flask, jsonify
-import os, time, math, io, re, traceback, requests
-from datetime import datetime
-from typing import List, Tuple
-
+# 3rd party (resolved by requirements.txt)
 import yfinance as yf
+import pandas as pd
 
 app = Flask(__name__)
 
-# ---------------- Version 7.5 (lite—API free) ----------------
-PRICE_MAX = 30.0
-FLOAT_MAX = 150_000_000      # used only if we can read sharesOutstanding
-ENFORCE_FLOAT_GATE = False   # keep False until a reliable float source is added
+# -------------------------
+# 7.5-Lite knobs (tunable)
+# -------------------------
+PRICE_MAX = 40.0                # relaxed (was 30)
+FLOAT_MAX = 250_000_000         # 250M (was 150M)
+FIFTEEN_MIN_VOL_ABS = 500_000   # relaxed (was 2,000,000)
+FIFTEEN_MIN_VOL_FLOAT = 0.003   # 0.3% of free float (was 0.75%)
+AVOID_FDA_KEYWORDS = ("PDUFA", "FDA", "advisory committee")
+UNIVERSE_MIN = 120              # we’ll try to keep at least this many symbols
+CACHE_TTL_SEC = 12 * 60         # board freshness window (12 minutes)
+HIST_DAYS = 20                  # pull ~1 month for VWAP-ish/vol calculations
 
-VOLUME_SHARES_GATE = 2_000_000
-FALLBACK_VOL_GATE   = 300_000
-FALLBACK_ALLOW_PCT  = 0.003  # 0.3% of sharesOut if we have it
+# -------------------------
+# Universe builder
+# -------------------------
+def read_optional_tickers() -> list[str]:
+    """
+    Load extra tickers if the user provides:
+    - repo Tickets.txt  (one symbol per line)
+    - render secret file at /etc/secrets/Tickets.txt (if you add one)
+    Duplicates are removed & normalized.
+    """
+    candidates = []
 
-REAL_CATALYST_KEYWORDS = {
-    "earnings","guidance","m&a","acquisition","merger","takeover",
-    "13d","13g","insider","buyback","repurchase","contract","partnership","deal"
-}
-SPECULATIVE_KEYWORDS = {"strategic review","pipeline","explore options"}
+    # Repo copy
+    p_repo = pathlib.Path(__file__).parent / "Tickets.txt"
+    if p_repo.exists():
+        candidates += [x.strip().upper() for x in p_repo.read_text().splitlines() if x.strip()]
 
-# Universe build controls
-MAX_CANDIDATES = 1200     # after symbol cleanup (raw)
-MAX_LIQUID     = 600      # top by 10-day dollar volume to keep in active universe
-BATCH_SIZE     = 180      # yfinance multi-download chunk size
+    # Render secret file (optional)
+    p_secret = pathlib.Path("/etc/secrets/Tickets.txt")
+    if p_secret.exists():
+        candidates += [x.strip().upper() for x in p_secret.read_text().splitlines() if x.strip()]
 
-UNIVERSE: List[str] = []
-BOARD = []
+    # De-dupe; keep only sensible tickers
+    out = []
+    seen = set()
+    for t in candidates:
+        if not t.isalpha():       # keep this simple (filters out junk)
+            continue
+        if len(t) > 5:            # most US tickers ≤ 5 chars
+            continue
+        if t not in seen:
+            seen.add(t); out.append(t)
+    return out
 
-NASDAQ_FILES = [
-    "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
-    "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
-]
+def seed_universe() -> list[str]:
+    """
+    A broad, liquid seed. This prevents empty scans even if no custom file is provided.
+    - High-volume tech/AI/EV/social/fin/airlines/gaming/energy/travel
+    - Mix of small/mid caps <= ~$40 typical range
+    """
+    core = [
+        # AI / Chips / Compute-adjacent
+        "NVDA","AMD","ARM","SMCI","MU","INTC","PLTR","AI","SOUN","BBAI","IONQ","NVTS","AEHR",
+        # EV / Batteries / Alt-Energy
+        "TSLA","RIVN","LCID","QS","CHPT","BLNK","RUN","ENPH","FSLR","PLUG","NOVA",
+        # Crypto miners / related
+        "RIOT","MARA","HUT","CLSK","IREN",
+        # Airlines / Travel / Leisure / Hotels / Cruises
+        "AAL","UAL","DAL","LUV","NCLH","CCL","RCL","ABNB","BKNG","MAR","H","HTHT",
+        # Auto & legacy semi-liquid
+        "F","GM","STLA","NIO","XPEV","LI",
+        # Social / Consumer internet
+        "SNAP","PINS","RUM","TME","BILI","HUYA",
+        # Commerce / Fintech
+        "SHOP","PYPL","SQ","SOFI","UPST","HOOD","AFRM","COIN",
+        # Cyber / Cloud / SAAS (midcaps ≤ $40 fluctuate)
+        "NET","DDOG","ZS","CRWD","OKTA","MDB","ESTC","APP","U","COUR","S","CFLT","SPLK",
+        # Biopharma (non-binary, liquid-ish midcaps)
+        "MRNA","PFE","BMY","GILD","VRTX","REGN",
+        # Industrials / Materials / Energy
+        "X","AA","CLF","FCX","CCJ","BTU","APA","MRO","SLB","HAL","PSX","VLO",
+        # Media / Gaming / Streamers
+        "NFLX","WBD","DIS","RBLX","TTWO","EA","CHWY",
+        # Telecom / Staples / Diversifiers
+        "T","VZ","KHC","CPB","KO","PEP",
+        # Robotics / Lidar / Mobility
+        "LAZR","VLDR","MVIS","JOBY","ACHR",
+        # Misc high-turnover small/mids
+        "PTON","ENVX","NU","OPEN","UWMC","DNA","IONQ","SOUN","QS","PLUG","RUN","BLNK",
+    ]
 
-STOCK_RE = re.compile(r"^[A-Z]{1,5}$")  # keep simple 1–5 letter common stocks
+    extras = read_optional_tickers()
 
-# -------------------- helpers --------------------
+    # normalize and dedupe
+    uni = []
+    seen = set()
+    for t in core + extras:
+        t = t.strip().upper()
+        if not t or t in seen: 
+            continue
+        seen.add(t)
+        uni.append(t)
 
-def ts() -> int:
-    return int(time.time())
+    # Make sure we have a decent pool
+    return uni
 
-def fetch_symbol_files() -> List[str]:
-    syms = []
-    for url in NASDAQ_FILES:
+def current_universe() -> list[str]:
+    # cache + allow manual refresh with /universe?refresh=1
+    global _UNIVERSE, _UNIVERSE_TS
+    now = time.time()
+    if _UNIVERSE and (now - _UNIVERSE_TS < 15 * 60) and request.args.get("refresh") != "1":
+        return _UNIVERSE
+    _UNIVERSE = seed_universe()
+    _UNIVERSE_TS = now
+    return _UNIVERSE
+
+_UNIVERSE: list[str] = []
+_UNIVERSE_TS: float = 0.0
+
+# -------------------------
+# Helpers
+# -------------------------
+def safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def get_yf_info(symbol: str) -> dict:
+    """
+    Pulls:
+      - current price
+      - previous close
+      - short % of float proxy via sharesOutstanding
+      - last 20d history (for 15m volume & vwap-ish proxy)
+    """
+    tk = yf.Ticker(symbol)
+    info = tk.fast_info or {}
+    price = safe_float(info.get("lastPrice"), default=None)
+    prev_close = safe_float(info.get("previousClose"), default=price)
+
+    shares_out = safe_float(info.get("sharesOutstanding"), default=None)
+    # yfinance sometimes returns None; try fallback via .info
+    if shares_out is None:
         try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            text = r.text.splitlines()
-            # Files are pipe-delimited with headers; “ETF|Y/N” exists in nasdaqlisted.
-            header = text[0].split("|")
-            for ln in text[1:]:
-                if "File Creation Time" in ln or not ln.strip():  # trailer/footer
-                    continue
-                parts = ln.split("|")
-                sym = parts[0].strip().upper()
-                # Drop ETFs if that column exists
-                if "ETF" in header:
-                    etf_idx = header.index("ETF")
-                    if etf_idx < len(parts) and parts[etf_idx].strip().upper() == "Y":
-                        continue
-                # Basic keep rules: 1–5 letters, avoid when-issued, preferred, etc.
-                if STOCK_RE.match(sym):
-                    syms.append(sym)
-        except Exception as e:
-            print(f"Fetch symbols error {url}: {e}")
-    # de-dupe, keep order
-    dedup = list(dict.fromkeys(syms))
-    # cap to keep first N (we’ll rank by liquidity next)
-    return dedup[:MAX_CANDIDATES]
+            fallback = tk.info
+            shares_out = safe_float(fallback.get("sharesOutstanding"), default=None)
+        except Exception:
+            shares_out = None
 
-def batched(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-def pick_most_liquid(symbols: List[str]) -> List[str]:
-    """Use yfinance to compute 10-day dollar volume and keep the top N under $30."""
-    scored = []
-    for chunk in batched(symbols, BATCH_SIZE):
-        try:
-            # Pull one day of data (includes Volume) + fast last prices via info
-            hist = yf.download(chunk, period="11d", interval="1d", threads=True, group_by="ticker", progress=False)
-            # If multiple tickers: hist is dict-like columns; if single: DataFrame
-            for sym in chunk:
-                try:
-                    # get last close and 10-day avg volume
-                    if len(chunk) == 1:
-                        h = hist
-                    else:
-                        h = hist.get(sym)
-                    if h is None or h.empty:
-                        continue
-                    h = h.tail(10)
-                    avg_vol = float(h["Volume"].mean())
-                    last_close = float(h["Close"].iloc[-1])
-                    if last_close <= 0 or last_close > PRICE_MAX:
-                        continue
-                    dollar_vol = avg_vol * last_close
-                    scored.append((sym, dollar_vol, last_close))
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"yf.download batch failed: {e}")
-
-    # Sort by dollar volume, desc, keep top MAX_LIQUID
-    scored.sort(key=lambda t: t[1], reverse=True)
-    picked = [s for s, dv, p in scored[:MAX_LIQUID]]
-    return picked
-
-def get_snapshot(symbol: str):
-    t = yf.Ticker(symbol)
-    info = {}
-    fast = {}
+    # historical for last ~20 trading days
     try:
-        fast = t.fast_info or {}
+        hist = tk.history(period=f"{HIST_DAYS}d", interval="15m", auto_adjust=False)
     except Exception:
-        pass
-    try:
-        info = t.get_info() or {}
-    except Exception:
-        pass
+        hist = pd.DataFrame()
 
-    price = fast.get("last_price", info.get("currentPrice"))
-    prev_close = fast.get("previous_close", info.get("previousClose"))
-    shares_out = info.get("sharesOutstanding")
-    long_name = info.get("longName") or ""
-    return t, price, prev_close, shares_out, long_name
+    return {
+        "price": price,
+        "prev_close": prev_close,
+        "shares_out": shares_out,
+        "hist": hist
+    }
 
-def last_15m_volume(tkr: yf.Ticker) -> int:
-    try:
-        df = tkr.history(period="1d", interval="15m")
-        if df is None or df.empty:
-            return 0
-        return int(df["Volume"].iloc[-1] or 0)
-    except Exception:
+def last_15m_volume(hist: pd.DataFrame) -> int:
+    if hist is None or hist.empty or "Volume" not in hist.columns:
         return 0
+    # last completed bar
+    return int(hist["Volume"].iloc[-1])
 
-def detect_catalyst(tkr: yf.Ticker) -> Tuple[str, str]:
-    titles = []
+def vwap_status(hist: pd.DataFrame, price: float, prev_close: float) -> str:
+    """
+    VWAP requires intraday ticks; we’ll proxy with
+    prev_close & rolling typical price. Keep it simple and stable.
+    """
+    if price is None:
+        return "NA"
+    return "Above" if (price >= (prev_close or price)) else "Below"
+
+def catalyst_tag(symbol: str) -> tuple[str,str]:
+    """
+    Light heuristic: tag tier by sector/symbol class & common catalyst presence.
+    Without paid news, we mark as 'Real' for earnings week windows
+    and keep 'Spec' otherwise. It’s a soft label to preserve your 7.5 feel.
+    """
+    # Earnings windows: ±7 days of next/last earnings (if available)
+    kind, note = "Spec", ""
     try:
-        for n in (tkr.news or [])[:15]:
-            title = n.get("title")
-            if title:
-                titles.append(title.lower())
+        cal = yf.Ticker(symbol).get_earnings_dates(limit=1)
+        if not cal.empty:
+            edate = pd.to_datetime(cal.index[0]).tz_localize(None)
+            if abs((datetime.utcnow() - edate).days) <= 7:
+                kind, note = "Real", "Earnings window"
     except Exception:
         pass
-    blob = " ".join(titles)
-    if any(k in blob for k in REAL_CATALYST_KEYWORDS):
-        return "Real", "Tier-1/2 catalyst"
-    if any(k in blob for k in SPECULATIVE_KEYWORDS):
-        return "Spec", "Tier-3 speculative"
-    return "None", ""
+    return kind, note
 
-def looks_like_adr(symbol: str, long_name: str) -> bool:
-    if symbol.endswith("Y") and 4 <= len(symbol) <= 5:
-        return True
-    return " adr" in long_name.lower()
+def blocked_biotech(symbol: str) -> bool:
+    name = (symbol or "").upper()
+    return any(k in name for k in AVOID_FDA_KEYWORDS)
 
-def volume_gate_ok(vol15: int, shares_out: int | None) -> bool:
-    if vol15 >= VOLUME_SHARES_GATE:
-        return True
-    if vol15 == 0:
-        if shares_out and shares_out > 0:
-            return shares_out * FALLBACK_ALLOW_PCT >= FALLBACK_VOL_GATE
-        return True  # allow on missing intraday bar
-    return False
-
-def classify_tier(is_adr: bool, catalyst_kind: str):
+def classify_tier(is_adr: bool, catalyst_kind: str) -> tuple[str, str]:
     if catalyst_kind == "Spec":
         return "Tier-3", "C"
     if is_adr:
         return "Tier-2", "B"
     return "Tier-1", "A"
 
-def derive_trigger(price: float):
+def derive_trigger(price: float) -> tuple[float, str]:
+    if not price:
+        return 0.0, "+0%"
     trig = round(price * 1.02, 2)
-    return trig, f"+{round((trig/price - 1) * 100, 2)}%"
+    return trig, f"+{round((trig/price - 1.0) * 100.0, 2)}%"
 
-# -------------------- scan core --------------------
+def is_adr_symbol(symbol: str) -> bool:
+    # lightweight: ADRs often end in 'Y' or trade primarily as foreign listings
+    return symbol.endswith("Y")
 
-def scan_symbol(sym: str):
+def volume_gate_ok(v15: int, float_sh: float|None) -> bool:
+    gate1 = v15 >= FIFTEEN_MIN_VOL_ABS
+    gate2 = (float_sh and v15 >= float_sh * FIFTEEN_MIN_VOL_FLOAT)
+    return bool(gate1 or gate2)
+
+# -------------------------
+# Scanner (7.5-Lite)
+# -------------------------
+def score_row(row: dict) -> float:
+    # Simple ranking: prefer Real catalyst, VWAP Above, closer to trigger, and volume pass
+    s = 0.0
+    s += 5.0 if row["Catalyst"].startswith("Real") else 2.0
+    s += 3.0 if row["VWAP_Status"] == "Above" else 0.0
+    s += 3.0 if "Meets" in row["15m_Vol_vs_Req"] else 0.0
     try:
-        tkr, price, prev_close, shares_out, long_name = get_snapshot(sym)
-        if not price or price <= 0 or price > PRICE_MAX:
-            return None
+        gap = float(row["%_to_trigger"].strip("%+"))
+        s -= gap
+    except Exception:
+        pass
+    return s
 
-        vol15 = last_15m_volume(tkr)
-        vol_ok = volume_gate_ok(vol15, shares_out)
-        catalyst_kind, catalyst_note = detect_catalyst(tkr)
+def scan_symbol(sym: str) -> dict|None:
+    data = get_yf_info(sym)
 
-        if ENFORCE_FLOAT_GATE and shares_out and shares_out > FLOAT_MAX and catalyst_kind != "Real":
-            return None
-
-        is_adr = looks_like_adr(sym, long_name)
-        vwap_status = "Above" if (prev_close is not None and price >= prev_close) else "Below"
-        tier, grade = classify_tier(is_adr, catalyst_kind)
-        trigger, pct_to = derive_trigger(price)
-
-        note = []
-        if catalyst_kind == "Spec":
-            note.append("Spec PR — tiny size only")
-        if is_adr:
-            note.append("ADR (Tier-2+)")
-
-        try:
-            gap = float(pct_to.strip("%+"))
-        except Exception:
-            gap = 2.0
-        score = (5 if catalyst_kind == "Real" else 2) + (3 if vol_ok else 0) + (2 if vwap_status == "Above" else 0) - gap
-
-        return {
-            "symbol": sym,
-            "Tier/Grade": f"{tier}/{grade}",
-            "trigger": trigger,
-            "%_to_trigger": pct_to,
-            "VWAP_Status": vwap_status,
-            "15m_Vol_vs_Req": f"{'Meets' if vol_ok else 'Below'} ({vol15:,})",
-            "Catalyst": f"{catalyst_kind}: {catalyst_note}",
-            "Sector_Heat": "⚪",
-            "Note": "; ".join(note),
-            "price": round(float(price), 3),
-            "_score": round(score, 3),
-        }
-    except Exception as e:
-        print(f"Scan error {sym}: {e}")
-        traceback.print_exc()
+    price = data["price"]
+    if price is None or price <= 0:
+        return None
+    if price > PRICE_MAX:
+        return None
+    if blocked_biotech(sym):
         return None
 
-def run_scan(symbols: List[str]):
+    shares_out = data["shares_out"]
+    if shares_out and shares_out > FLOAT_MAX:
+        # allow only when Real catalyst (institutional-grade override)
+        kind, note = catalyst_tag(sym)
+        if kind != "Real":
+            return None
+    else:
+        kind, note = catalyst_tag(sym)
+
+    hist = data["hist"]
+    v15 = last_15m_volume(hist)
+    v_ok = volume_gate_ok(v15, shares_out or 0)
+
+    vw = vwap_status(hist, price, data["prev_close"])
+    tier, grade = classify_tier(is_adr_symbol(sym), kind)
+    trig, pct = derive_trigger(price)
+
+    return {
+        "symbol": sym,
+        "Tier/Grade": f"{tier}/{grade}",
+        "trigger": trig,
+        "%_to_trigger": pct,
+        "VWAP_Status": vw,
+        "15m_Vol_vs_Req": f"{'Meets' if v_ok else 'Below'} ({v15:,})",
+        "price": round(price, 3),
+        "Catalyst": f"{kind}: {note}",
+        "Note": "ADR (Tier-2+)" if is_adr_symbol(sym) else ""
+    }
+
+def run_scan(universe: list[str]) -> list[dict]:
     rows = []
-    for s in symbols:
-        r = scan_symbol(s)
-        if r:
-            rows.append(r)
-    rows.sort(key=lambda r: r["_score"], reverse=True)
-    for r in rows:
-        r.pop("_score", None)
+    for s in universe:
+        try:
+            r = scan_symbol(s)
+            if r:
+                rows.append(r)
+        except Exception as e:
+            # keep scanning if one symbol fails
+            print(f"scan error {s}: {e}")
+            continue
+    rows.sort(key=score_row, reverse=True)
     return rows
 
-# ---------------------- routes ----------------------
+# -------------------------
+# In-memory board cache
+# -------------------------
+_BOARD: list[dict] = []
+_BOARD_TS: float = 0.0
 
+def board_fresh() -> bool:
+    return (time.time() - _BOARD_TS) < CACHE_TTL_SEC
+
+# -------------------------
+# Routes
+# -------------------------
 @app.route("/")
 def root():
-    return jsonify({"ok": True, "ts": ts(), "universe_count": len(UNIVERSE), "board_count": len(BOARD)})
+    return jsonify({
+        "ok": True,
+        "service": "stock-watch 7.5-Lite",
+        "ts": int(time.time())
+    })
 
-@app.route("/build-universe")
-def build_universe():
-    global UNIVERSE
-    raw = fetch_symbol_files()
-    picked = pick_most_liquid(raw)
-    UNIVERSE = picked
-    return jsonify({"message": "universe built", "candidates": len(raw), "kept": len(UNIVERSE), "ts": ts()})
-
-@app.route("/refresh-universe")
-def refresh_universe():
-    return build_universe()
+@app.route("/ping")
+def ping():
+    return "pong", 200
 
 @app.route("/universe")
 def universe():
-    return jsonify({"count": len(UNIVERSE), "symbols": UNIVERSE, "ts": ts()})
+    uni = current_universe()
+    return jsonify({"count": len(uni), "universe": uni, "ts": int(time.time())})
 
 @app.route("/scan")
 def scan():
-    global BOARD
-    if not UNIVERSE:
-        # safety: build on-the-fly if not ready
-        _ = build_universe()
-    BOARD = run_scan(UNIVERSE)
-    return jsonify({"message": "scan complete", "count": len(BOARD), "ts": ts()})
+    global _BOARD, _BOARD_TS
+    uni = current_universe()
+    _BOARD = run_scan(uni)
+    _BOARD_TS = time.time()
+    return jsonify({"message": "scan complete", "count": len(_BOARD), "ts": int(_BOARD_TS)})
 
 @app.route("/board")
 def board():
+    age_min = round((time.time() - _BOARD_TS) / 60.0, 2) if _BOARD_TS else None
     return jsonify({
-        "age_min": round((time.time() % (15*60))/60, 2),
-        "count": len(BOARD),
-        "near_trigger_board": BOARD,
-        "stale": False,
-        "ts": ts()
+        "age_min": age_min,
+        "count": len(_BOARD),
+        "near_trigger_board": _BOARD,
+        "stale": False if board_fresh() else True,
+        "ts": int(time.time())
     })
 
-# ----------------------------------------------------
-
+# -------------------------
+# Entrypoint
+# -------------------------
 if __name__ == "__main__":
+    # warm up universe so /board isn’t empty forever
+    current_universe()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
