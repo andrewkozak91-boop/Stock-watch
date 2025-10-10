@@ -3,9 +3,5 @@ gunicorn==21.2.0
 requests==2.32.3
 python-dotenv==1.0.1
 schedule==1.2.1
-pandas==2.2.2
-numpy==1.26.4
-yfinance==0.2.40
-beautifulsoup4==4.12.3
-pytz
-tzdata
+pytz==2024.1
+tzdata==2024.1
