@@ -5,8 +5,8 @@ python --version
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 
-# tiny smoke to show we installed
+# tiny smoke test to confirm dependencies installed correctly
 python - <<'PY'
 import flask, requests
-print("deps ok")
+print("Dependencies installed successfully.")
 PY
